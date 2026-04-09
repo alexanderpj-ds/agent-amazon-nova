@@ -29,8 +29,8 @@ fi
 
 IMAGE_URI="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/${REPO_NAME}:${IMAGE_TAG}"
 
-echo "🔨 Building new image with $ENGINE..."
-$ENGINE build -t ${REPO_NAME}:${IMAGE_TAG} .
+echo "🔨 Building new image with $ENGINE (linux/amd64 for ECS Fargate)..."
+$ENGINE build --platform linux/amd64 -t ${REPO_NAME}:${IMAGE_TAG} .
 
 echo "🔐 Authenticating with ECR..."
 aws ecr get-login-password --region ${REGION} --profile ${PROFILE} | \

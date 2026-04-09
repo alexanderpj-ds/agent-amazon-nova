@@ -1,7 +1,13 @@
 """
-Nova Sonic Client — simple and clean.
-No history, no automatic reconnection.
-Session expires after 8 minutes or 55s inactivity — user must refresh.
+Nova Sonic Client — Bidirectional streaming with Amazon Nova 2 Sonic.
+
+Supports both voice and text input (cross-modal).
+
+Key requirements from AWS documentation:
+- Cross-modal input requires continuous audio streaming
+- Session timeout: 55 seconds of inactivity OR 8 minutes max duration
+- Silence must be sent continuously when mic is not active
+- Text input uses interactive=True with unique contentName per message
 """
 
 import asyncio
@@ -9,6 +15,8 @@ import base64
 import json
 import uuid
 import logging
+import os
+from pathlib import Path
 from aws_sdk_bedrock_runtime.client import BedrockRuntimeClient, InvokeModelWithBidirectionalStreamOperationInput
 from aws_sdk_bedrock_runtime.models import InvokeModelWithBidirectionalStreamInputChunk, BidirectionalInputPayloadPart
 from aws_sdk_bedrock_runtime.config import Config, HTTPAuthSchemeResolver, SigV4AuthScheme
@@ -20,24 +28,42 @@ MODEL_ID = "amazon.nova-2-sonic-v1:0"
 REGION = "us-east-1"
 VOICE_ID = "lupe"  # Native Spanish (es-US) feminine voice
 
-SYSTEM_PROMPT = (
-    "Eres DatIA, una experta en gobierno de datos y gobierno de inteligencia artificial. "
-    "Tu conocimiento abarca tanto el gobierno de datos — con base en COBIT 2019, DAMA-DMBOK segunda edicion "
-    "y el libro Data Governance: The Definitive Guide — como el gobierno de IA, incluyendo marcos de etica, "
-    "responsabilidad, transparencia, gestion de riesgos de modelos, y regulaciones emergentes como el AI Act europeo. "
-    "Cuando el usuario inicia la conversacion, preguntale brevemente sobre que tema especifico necesita ayuda. "
-    "Haz una pregunta a la vez para entender su contexto antes de aconsejar. "
-    "Responde siempre en espanol. "
-    "Se concisa: respuestas cortas de dos o tres oraciones para conversacion de voz. "
-    "No uses listas ni bullets, habla de forma natural como en una conversacion. "
-    "Mantente en tu rol de experta en gobierno de datos y gobierno de IA."
-)
+# Load system prompt from file
+def _load_system_prompt() -> str:
+    """Load system prompt from prompts/PromptDatIA_v2.md file."""
+    # Try multiple paths (for local dev and Docker container)
+    possible_paths = [
+        Path(__file__).parent / "prompts" / "PromptDatIA_v2.md",
+        Path("/app/prompts/PromptDatIA_v2.md"),
+        Path("prompts/PromptDatIA_v2.md"),
+    ]
+    
+    for prompt_path in possible_paths:
+        if prompt_path.exists():
+            content = prompt_path.read_text(encoding="utf-8")
+            logger.info(f"System prompt loaded from {prompt_path}")
+            return content
+    
+    # Fallback if file not found
+    logger.warning("Prompt file not found, using fallback prompt")
+    return (
+        "Eres DatIA, una experta en gobierno de datos y gobierno de inteligencia artificial. "
+        "Responde siempre en español. Se concisa."
+    )
 
-# 2048 bytes of silence (1024 frames * 2 bytes) — sent every 5s to prevent 55s timeout
-SILENCE_B64 = base64.b64encode(bytes(1024 * 2)).decode()
+SYSTEM_PROMPT = _load_system_prompt()
+
+# Silence chunk: 1024 frames * 2 bytes = 2048 bytes of silence
+# At 16kHz, this is ~64ms of audio
+SILENCE_CHUNK = bytes(1024 * 2)
+SILENCE_B64 = base64.b64encode(SILENCE_CHUNK).decode()
+
+# Silence interval in seconds - send frequently to keep stream alive
+SILENCE_INTERVAL = 0.05  # 50ms - AWS recommends continuous streaming
 
 
 class NovaSonicClient:
+    """Client for bidirectional streaming with Amazon Nova 2 Sonic."""
 
     def __init__(self):
         self.model_id = MODEL_ID
@@ -48,30 +74,30 @@ class NovaSonicClient:
         self.silence_task = None
         self.is_active = False
         self.mic_active = False
-        self._sending_text = False
 
+        # Session identifiers
         self.prompt_name = None
-        self.content_name = None
-        self.audio_content_name = None
+        self.content_name = None  # For system prompt
+        self.audio_content_name = None  # For audio stream
 
+        # Response tracking
         self.role = None
         self.display_assistant_text = False
-        self._is_final = False
 
+        # Callbacks
         self.on_audio_output = None
         self.on_text_output = None
         self.on_reconnected = None
 
+        # Lock for thread-safe sending
+        self._send_lock = asyncio.Lock()
+
     def _initialize_client(self):
-        # In ECS Fargate, credentials come from the Task Role via the container
-        # metadata endpoint. These credentials are temporary and expire after a few hours.
-        # We must refresh them on each session to avoid using stale credentials.
-        # The experimental SDK only supports EnvironmentCredentialsResolver, so we use
-        # boto3 to fetch fresh credentials and inject them into the environment.
+        """Initialize the Bedrock client with fresh credentials."""
         import os
         import boto3
         
-        # Always refresh credentials from boto3 (it handles ECS Task Role automatically)
+        # Refresh credentials from boto3 (handles ECS Task Role automatically)
         try:
             session = boto3.Session()
             creds = session.get_credentials()
@@ -81,7 +107,7 @@ class NovaSonicClient:
                 os.environ['AWS_SECRET_ACCESS_KEY'] = frozen.secret_key
                 if frozen.token:
                     os.environ['AWS_SESSION_TOKEN'] = frozen.token
-                logger.info("Credentials refreshed from boto3 session (ECS Task Role)")
+                logger.info("Credentials refreshed from boto3 session")
         except Exception as e:
             logger.warning(f"Could not refresh credentials via boto3: {e}")
 
@@ -96,121 +122,205 @@ class NovaSonicClient:
         logger.info("Bedrock client initialized")
 
     async def _send(self, event_dict: dict):
-        chunk = InvokeModelWithBidirectionalStreamInputChunk(
-            value=BidirectionalInputPayloadPart(bytes_=json.dumps(event_dict).encode())
-        )
-        await self.stream.input_stream.send(chunk)
+        """Send an event to the stream (thread-safe)."""
+        if not self.stream or not self.is_active:
+            return
+        async with self._send_lock:
+            try:
+                chunk = InvokeModelWithBidirectionalStreamInputChunk(
+                    value=BidirectionalInputPayloadPart(bytes_=json.dumps(event_dict).encode())
+                )
+                await self.stream.input_stream.send(chunk)
+            except Exception as e:
+                if self.is_active:
+                    logger.error(f"Error sending event: {e}")
+                raise
 
     async def start_session(self):
-        # Always reinitialize client to get fresh credentials
+        """Start a new Nova Sonic session."""
         self._initialize_client()
 
+        # Generate unique identifiers for this session
         self.prompt_name = str(uuid.uuid4())
         self.content_name = str(uuid.uuid4())
         self.audio_content_name = str(uuid.uuid4())
         self.mic_active = False
-        self._sending_text = False
         self.role = None
         self.display_assistant_text = False
-        self._is_final = False
 
+        # Open bidirectional stream
         self.stream = await self.client.invoke_model_with_bidirectional_stream(
             InvokeModelWithBidirectionalStreamOperationInput(model_id=self.model_id)
         )
         self.is_active = True
         logger.info("Stream opened")
 
+        # 1. Session Start
         await self._send({"event": {"sessionStart": {
-            "inferenceConfiguration": {"maxTokens": 1024, "topP": 0.9, "temperature": 0.7},
-            "turnDetectionConfiguration": {"endpointingSensitivity": "HIGH"}
+            "inferenceConfiguration": {
+                "maxTokens": 1024,
+                "topP": 0.9,
+                "temperature": 0.7
+            },
+            "turnDetectionConfiguration": {
+                "endpointingSensitivity": "HIGH"
+            }
         }}})
 
+        # 2. Prompt Start - configure audio output
         await self._send({"event": {"promptStart": {
             "promptName": self.prompt_name,
             "textOutputConfiguration": {"mediaType": "text/plain"},
             "audioOutputConfiguration": {
-                "mediaType": "audio/lpcm", "sampleRateHertz": 24000,
-                "sampleSizeBits": 16, "channelCount": 1,
-                "voiceId": VOICE_ID, "encoding": "base64", "audioType": "SPEECH"
+                "mediaType": "audio/lpcm",
+                "sampleRateHertz": 24000,
+                "sampleSizeBits": 16,
+                "channelCount": 1,
+                "voiceId": VOICE_ID,
+                "encoding": "base64",
+                "audioType": "SPEECH"
             }
         }}})
 
+        # 3. System Prompt (non-interactive)
         await self._send({"event": {"contentStart": {
-            "promptName": self.prompt_name, "contentName": self.content_name,
-            "type": "TEXT", "interactive": False, "role": "SYSTEM",
+            "promptName": self.prompt_name,
+            "contentName": self.content_name,
+            "type": "TEXT",
+            "interactive": False,
+            "role": "SYSTEM",
             "textInputConfiguration": {"mediaType": "text/plain"}
         }}})
         await self._send({"event": {"textInput": {
-            "promptName": self.prompt_name, "contentName": self.content_name,
+            "promptName": self.prompt_name,
+            "contentName": self.content_name,
             "content": SYSTEM_PROMPT
         }}})
         await self._send({"event": {"contentEnd": {
-            "promptName": self.prompt_name, "contentName": self.content_name
+            "promptName": self.prompt_name,
+            "contentName": self.content_name
         }}})
 
-        # Open audio block once — stays open for the whole session
+        # 4. Open Audio Stream (stays open for entire session)
+        # This is required for both voice AND text input (cross-modal)
         await self._send({"event": {"contentStart": {
             "promptName": self.prompt_name,
             "contentName": self.audio_content_name,
-            "type": "AUDIO", "interactive": True, "role": "USER",
+            "type": "AUDIO",
+            "interactive": True,
+            "role": "USER",
             "audioInputConfiguration": {
-                "mediaType": "audio/lpcm", "sampleRateHertz": 16000,
-                "sampleSizeBits": 16, "channelCount": 1,
-                "audioType": "SPEECH", "encoding": "base64"
+                "mediaType": "audio/lpcm",
+                "sampleRateHertz": 16000,
+                "sampleSizeBits": 16,
+                "channelCount": 1,
+                "audioType": "SPEECH",
+                "encoding": "base64"
             }
         }}})
 
+        # Start background tasks
         self.response_task = asyncio.create_task(self._process_responses())
         self.silence_task = asyncio.create_task(self._stream_silence())
-        logger.info("Session ready")
+        
+        logger.info("Session ready - audio stream open")
 
     async def end_session(self):
+        """End the current session and clean up resources."""
         if not self.is_active:
             return
+        
         self.is_active = False
+        logger.info("Ending session...")
+
+        # Cancel background tasks
         if self.silence_task and not self.silence_task.done():
             self.silence_task.cancel()
+            try:
+                await self.silence_task
+            except asyncio.CancelledError:
+                pass
+
+        # Send closing events
         try:
+            # Close audio content
             await self._send({"event": {"contentEnd": {
-                "promptName": self.prompt_name, "contentName": self.audio_content_name
+                "promptName": self.prompt_name,
+                "contentName": self.audio_content_name
             }}})
-            await self._send({"event": {"promptEnd": {"promptName": self.prompt_name}}})
+            # Close prompt
+            await self._send({"event": {"promptEnd": {
+                "promptName": self.prompt_name
+            }}})
+            # End session
             await self._send({"event": {"sessionEnd": {}}})
+            # Close stream
             await self.stream.input_stream.close()
         except Exception as e:
-            logger.warning(f"Close error: {e}")
+            logger.warning(f"Error during session close: {e}")
+
+        # Cancel response task
         if self.response_task and not self.response_task.done():
             self.response_task.cancel()
+            try:
+                await self.response_task
+            except asyncio.CancelledError:
+                pass
+
         logger.info("Session ended")
 
     async def _stream_silence(self):
-        """Send silence every 5s to keep the audio block alive (prevents 55s timeout)."""
-        await asyncio.sleep(3)  # Wait for stream to stabilize
+        """
+        Send continuous silence to keep the audio stream alive.
+        
+        CRITICAL: AWS documentation states that cross-modal input requires
+        continuous audio streaming. Without this, the session will timeout
+        after 55 seconds of inactivity.
+        
+        "Cross-modal input requires an active streaming session to function
+        properly. The session must maintain continuous streaming like a regular
+        voice session, otherwise standard session timeouts will be applied."
+        """
+        await asyncio.sleep(0.5)  # Brief wait for stream to stabilize
+        
+        logger.info("Silence streaming started")
+        
         try:
             while self.is_active:
-                if not self.mic_active and not self._sending_text:
-                    await self._send({"event": {"audioInput": {
-                        "promptName": self.prompt_name,
-                        "contentName": self.audio_content_name,
-                        "content": SILENCE_B64
-                    }}})
-                    logger.debug("Silence sent to keep stream alive")
-                await asyncio.sleep(5)
+                # Only send silence when microphone is NOT active
+                # When mic is active, real audio is being sent
+                if not self.mic_active:
+                    try:
+                        await self._send({"event": {"audioInput": {
+                            "promptName": self.prompt_name,
+                            "contentName": self.audio_content_name,
+                            "content": SILENCE_B64
+                        }}})
+                    except Exception as e:
+                        if self.is_active:
+                            logger.warning(f"Error sending silence: {e}")
+                
+                # Sleep briefly - continuous streaming is required
+                await asyncio.sleep(SILENCE_INTERVAL)
+                
         except asyncio.CancelledError:
-            pass
+            logger.debug("Silence streaming cancelled")
         except Exception as e:
             if self.is_active:
-                logger.warning(f"Silence error: {e}")
+                logger.error(f"Silence streaming error: {e}")
 
     def start_mic(self):
+        """Signal that microphone is active (real audio being sent)."""
         self.mic_active = True
-        logger.info("Mic active")
+        logger.info("Mic active - pausing silence")
 
     def stop_mic(self):
+        """Signal that microphone is inactive (resume silence)."""
         self.mic_active = False
-        logger.info("Mic inactive")
+        logger.info("Mic inactive - resuming silence")
 
     async def send_audio_chunk(self, audio_bytes: bytes):
+        """Send a chunk of audio from the microphone."""
         if not self.is_active:
             return
         await self._send({"event": {"audioInput": {
@@ -220,94 +330,156 @@ class NovaSonicClient:
         }}})
 
     async def send_text_message(self, text: str):
+        """
+        Send a text message using cross-modal input.
+        
+        Per AWS documentation:
+        - Text input uses a separate content block with interactive=True
+        - Each message needs a unique contentName
+        - Audio stream must remain active (silence continues)
+        """
         if not self.is_active:
+            logger.warning("Cannot send text: session not active")
             return
-        self._sending_text = True
+        if not self.stream:
+            logger.warning("Cannot send text: stream is None")
+            return
+
+        # Generate unique content name for this text message
+        text_content_name = str(uuid.uuid4())
+        
         try:
-            cid = str(uuid.uuid4())
+            logger.info(f"Sending text message: {text[:50]}...")
+            
+            # 1. Content Start for text (interactive=True for cross-modal)
             await self._send({"event": {"contentStart": {
-                "promptName": self.prompt_name, "contentName": cid,
-                "role": "USER", "type": "TEXT", "interactive": True,
+                "promptName": self.prompt_name,
+                "contentName": text_content_name,
+                "type": "TEXT",
+                "interactive": True,
+                "role": "USER",
                 "textInputConfiguration": {"mediaType": "text/plain"}
             }}})
+            
+            # 2. Text Input
             await self._send({"event": {"textInput": {
-                "promptName": self.prompt_name, "contentName": cid, "content": text
+                "promptName": self.prompt_name,
+                "contentName": text_content_name,
+                "content": text
             }}})
+            
+            # 3. Content End
             await self._send({"event": {"contentEnd": {
-                "promptName": self.prompt_name, "contentName": cid
+                "promptName": self.prompt_name,
+                "contentName": text_content_name
             }}})
-            logger.info(f"Text sent: {text[:60]}")
-        finally:
-            self._sending_text = False
+            
+            logger.info(f"Text message sent successfully")
+            
+        except Exception as e:
+            logger.error(f"Error sending text message: {e}")
+            raise
 
     async def _process_responses(self):
+        """Process incoming responses from Nova Sonic."""
+        logger.info("Response processor started")
+        
         try:
             while self.is_active:
-                output = await self.stream.await_output()
-                result = await output[1].receive()
-                if not (result.value and result.value.bytes_):
+                try:
+                    # Wait for output with timeout
+                    output = await asyncio.wait_for(
+                        self.stream.await_output(),
+                        timeout=60.0  # 60 second timeout
+                    )
+                    result = await output[1].receive()
+                    
+                    if not (result.value and result.value.bytes_):
+                        continue
+
+                    data = json.loads(result.value.bytes_.decode())
+                    event = data.get('event', {})
+                    
+                    # Log non-audio events for debugging
+                    event_type = list(event.keys())[0] if event else 'unknown'
+                    if event_type != 'audioOutput':
+                        logger.info(f"Event: {event_type}")
+                    
+                    # Handle error events
+                    if 'error' in event:
+                        logger.error(f"Nova Sonic error: {event['error']}")
+                        continue
+
+                    # Handle content start - track role and generation stage
+                    if 'contentStart' in event:
+                        cs = event['contentStart']
+                        self.role = cs.get('role')
+                        
+                        additional = cs.get('additionalModelFields')
+                        if additional:
+                            try:
+                                stage = json.loads(additional).get('generationStage', '')
+                                self.display_assistant_text = (stage == 'SPECULATIVE')
+                            except:
+                                self.display_assistant_text = False
+                        else:
+                            self.display_assistant_text = False
+
+                    # Handle text output (transcripts)
+                    elif 'textOutput' in event:
+                        text = event['textOutput'].get('content', '')
+                        if text and self.on_text_output:
+                            if self.role == 'ASSISTANT' and self.display_assistant_text:
+                                await self.on_text_output('assistant', text)
+                            elif self.role == 'USER':
+                                await self.on_text_output('user', text)
+
+                    # Handle audio output
+                    elif 'audioOutput' in event:
+                        audio_b64 = event['audioOutput'].get('content', '')
+                        if self.on_audio_output and audio_b64:
+                            await self.on_audio_output(audio_b64)
+
+                except asyncio.TimeoutError:
+                    # No response in 60s - stream might be stale
+                    if self.is_active:
+                        logger.warning("No response in 60s - checking stream health")
                     continue
 
-                data = json.loads(result.value.bytes_.decode())
-                event = data.get('event', {})
-                
-                # Log all events for debugging
-                event_type = list(event.keys())[0] if event else 'unknown'
-                if event_type not in ['audioOutput']:  # Don't spam audio logs
-                    logger.info(f"Event received: {event_type}")
-                
-                # Check for error events
-                if 'error' in event:
-                    logger.error(f"Error event from Nova Sonic: {event['error']}")
-
-                if 'contentStart' in event:
-                    cs = event['contentStart']
-                    self.role = cs.get('role')
-                    additional = cs.get('additionalModelFields')
-                    if additional:
-                        stage = json.loads(additional).get('generationStage', '')
-                        self.display_assistant_text = (stage == 'SPECULATIVE')
-                        self._is_final = (stage == 'FINAL')
-                    else:
-                        self.display_assistant_text = False
-                        self._is_final = False
-
-                elif 'textOutput' in event:
-                    text = event['textOutput'].get('content', '')
-                    if text and self.on_text_output:
-                        if self.role == 'ASSISTANT' and self.display_assistant_text:
-                            await self.on_text_output('assistant', text)
-                        elif self.role == 'USER':
-                            await self.on_text_output('user', text)
-
-                elif 'audioOutput' in event:
-                    audio_b64 = event['audioOutput'].get('content', '')
-                    if self.on_audio_output and audio_b64:
-                        await self.on_audio_output(audio_b64)
-
         except asyncio.CancelledError:
-            pass
+            logger.info("Response processor cancelled")
         except Exception as e:
             if self.is_active:
-                logger.error(f"Session error (reconnecting): {e}")
+                logger.error(f"Response processor error: {e}", exc_info=True)
+                # Attempt reconnection
                 asyncio.create_task(self._reconnect())
 
     async def _reconnect(self):
-        """Reconnect with a clean session — no history injected."""
-        logger.info("Reconnecting with clean session...")
+        """Reconnect with a clean session."""
+        logger.info("Attempting reconnection...")
+        
         self.is_active = False
+        
+        # Cancel tasks
         if self.silence_task and not self.silence_task.done():
             self.silence_task.cancel()
         if self.response_task and not self.response_task.done():
             self.response_task.cancel()
+        
+        # Close stream
         try:
             await self.stream.input_stream.close()
         except Exception:
             pass
+        
+        # Wait before reconnecting
         await asyncio.sleep(1)
+        
+        # Start new session
         try:
             await self.start_session()
             if self.on_reconnected:
                 await self.on_reconnected()
+            logger.info("Reconnection successful")
         except Exception as e:
             logger.error(f"Reconnection failed: {e}")
