@@ -30,12 +30,12 @@ VOICE_ID = "lupe"  # Native Spanish (es-US) feminine voice
 
 # Load system prompt from file
 def _load_system_prompt() -> str:
-    """Load system prompt from prompts/PromptDatIA_v2.md file."""
+    """Load system prompt from prompts/PromptDatIA_v4.md file."""
     # Try multiple paths (for local dev and Docker container)
     possible_paths = [
-        Path(__file__).parent / "prompts" / "PromptDatIA_v2.md",
-        Path("/app/prompts/PromptDatIA_v2.md"),
-        Path("prompts/PromptDatIA_v2.md"),
+        Path(__file__).parent / "prompts" / "PromptDatIA_v4.md",
+        Path("/app/prompts/PromptDatIA_v4.md"),
+        Path("prompts/PromptDatIA_v4.md"),
     ]
     
     for prompt_path in possible_paths:

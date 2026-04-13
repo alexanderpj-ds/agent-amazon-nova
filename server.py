@@ -37,6 +37,17 @@ async def root():
     return {"status": "DatIA Voice Server running", "model": "amazon.nova-2-sonic-v1:0"}
 
 
+@app.get("/health")
+async def health_check():
+    """
+    Health check endpoint for ECS container health monitoring.
+    
+    ECS calls this endpoint periodically. If it fails multiple times,
+    ECS automatically restarts the container.
+    """
+    return {"status": "healthy"}
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """
